@@ -19,6 +19,7 @@
 #include <string.h>
 #include <errno.h>
 #include <net/if.h>
+#include <linux/if_link.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
