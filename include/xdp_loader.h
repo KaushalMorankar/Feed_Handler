@@ -4,6 +4,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Optional flow filter, applied by xdp_loader_attach() before the program
+ * goes live. group_be = IPv4 destination in network byte order (0 = any),
+ * port = UDP destination port (host order), vlan_id = outer 802.1Q VID
+ * to require (0 = don't care). Defaults: any group, port 15000, any VLAN. */
+void xdp_loader_set_filter(uint32_t group_be, uint16_t port, uint16_t vlan_id);
+
 /* Load bpf_obj_path (compiled from xdp_kern.c), attach to ifname's XDP
  * hook. skb_mode=true uses generic XDP (works everywhere, no zero-copy);
  * false requests native driver XDP (required for true zero-copy). */

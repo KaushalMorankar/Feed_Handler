@@ -39,14 +39,19 @@ seq_result_t seq_tracker_observe(seq_tracker_t *t, uint32_t seq, uint64_t now_ns
         return SEQ_RESULT_OK;
     }
 
-    if (seq < t->expected_seq) {
+    /* Serial-number arithmetic (RFC 1982 style): compare via the signed
+     * difference so the uint32 wrap at 2^32 is not mistaken for a huge
+     * stale/duplicate packet. Valid while the true distance < 2^31. */
+    int32_t delta = (int32_t)(seq - t->expected_seq);
+
+    if (delta < 0) {
         /* stale/duplicate: multicast retransmit, or we already recovered
          * this range. Not an error condition on its own. */
         t->packets_duplicate_or_stale++;
         return SEQ_RESULT_DUPLICATE;
     }
 
-    if (seq == t->expected_seq) {
+    if (delta == 0) {
         t->expected_seq = seq + 1;
         return SEQ_RESULT_OK;
     }

@@ -21,8 +21,20 @@
 #include <net/if.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <linux/if_link.h>   /* XDP_FLAGS_* */
+#include <arpa/inet.h>
 
+#include "xdp_cfg.h"
 #include "xdp_loader.h"
+
+/* libbpf < 0.8 (e.g. Ubuntu 22.04's 0.5) predates bpf_xdp_attach();
+ * fall back to the older bpf_set_link_xdp_fd(). */
+#if defined(LIBBPF_MAJOR_VERSION) && \
+    (LIBBPF_MAJOR_VERSION > 0 || LIBBPF_MINOR_VERSION >= 8)
+#define XDP_ATTACH(ifidx, fd, flags) bpf_xdp_attach((ifidx), (fd), (flags), NULL)
+#else
+#define XDP_ATTACH(ifidx, fd, flags) bpf_set_link_xdp_fd((ifidx), (fd), (flags))
+#endif
 
 struct xdp_loader_ctx {
     struct bpf_object *obj;
@@ -33,6 +45,16 @@ struct xdp_loader_ctx {
 };
 
 static struct xdp_loader_ctx g_ctx;
+
+static uint32_t g_filter_group_be = 0;
+static uint16_t g_filter_port = 15000;
+static uint16_t g_filter_vlan = 0;
+
+void xdp_loader_set_filter(uint32_t group_be, uint16_t port, uint16_t vlan_id) {
+    g_filter_group_be = group_be;
+    g_filter_port = port;
+    g_filter_vlan = vlan_id;
+}
 
 int xdp_loader_attach(const char *ifname, const char *bpf_obj_path, bool skb_mode) {
     memset(&g_ctx, 0, sizeof(g_ctx));
@@ -69,6 +91,24 @@ int xdp_loader_attach(const char *ifname, const char *bpf_obj_path, bool skb_mod
     }
     g_ctx.xsks_map_fd = bpf_map__fd(xsks_map);
 
+    /* Write the flow filter before the program is attached, so there is
+     * no window where it runs with defaults. */
+    struct bpf_map *cfg_map = bpf_object__find_map_by_name(g_ctx.obj, "xdp_cfg");
+    if (!cfg_map) {
+        fprintf(stderr, "xdp_loader: map 'xdp_cfg' not found in object\n");
+        return -1;
+    }
+    struct xdp_cfg cfg = {
+        .group_be = g_filter_group_be,
+        .port_be = htons(g_filter_port),
+        .vlan_id = g_filter_vlan,
+    };
+    __u32 zero = 0;
+    if (bpf_map_update_elem(bpf_map__fd(cfg_map), &zero, &cfg, BPF_ANY)) {
+        fprintf(stderr, "xdp_loader: failed to write xdp_cfg: %s\n", strerror(errno));
+        return -1;
+    }
+
     /* Attach flags: prefer native (driver) XDP for zero-copy; fall back
      * to generic/SKB mode (works on any NIC driver, but the kernel still
      * allocates an skb first -- useful for testing on hardware/drivers
@@ -76,7 +116,7 @@ int xdp_loader_attach(const char *ifname, const char *bpf_obj_path, bool skb_mod
      * to avoid). */
     unsigned int flags = skb_mode ? XDP_FLAGS_SKB_MODE : XDP_FLAGS_DRV_MODE;
 
-    int err = bpf_xdp_attach(g_ctx.ifindex, g_ctx.prog_fd, flags, NULL);
+    int err = XDP_ATTACH(g_ctx.ifindex, g_ctx.prog_fd, flags);
     if (err) {
         fprintf(stderr, "xdp_loader: bpf_xdp_attach failed (%d): %s. If this is a "
                          "driver that lacks native XDP support, retry with skb_mode=true.\n",
@@ -99,7 +139,7 @@ int xdp_loader_bind_queue(uint32_t queue_id, int xsk_fd) {
 
 void xdp_loader_detach(void) {
     if (g_ctx.ifindex) {
-        bpf_xdp_attach(g_ctx.ifindex, -1, XDP_FLAGS_UPDATE_IF_NOEXIST, NULL);
+        XDP_ATTACH(g_ctx.ifindex, -1, 0);
     }
     if (g_ctx.obj) {
         bpf_object__close(g_ctx.obj);

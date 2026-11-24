@@ -1,11 +1,15 @@
 # High-Throughput User-Space Market Data Feed Handler (AF_XDP Kernel Bypass)
 
 A UDP multicast market-data feed handler that reads packets directly off
-the NIC's ring buffers via **AF_XDP** (zero-copy, eBPF-driven kernel
-bypass), reassembles an MDP3-style sequenced binary protocol, detects
-and reports sequence gaps, and hands decoded messages to a processing
-thread through a lock-free ring buffer — no syscalls, no skb allocation,
-no memcpy across the kernel/user boundary on the hot path.
+the NIC's ring buffers via **AF_XDP** (eBPF-driven kernel bypass),
+decodes an MDP3-style sequenced binary protocol, detects and reports
+sequence gaps, and hands decoded messages to a processing thread through
+a lock-free ring buffer. On a NIC with native zero-copy support the RX
+path has no per-packet syscall, skb allocation or kernel-to-user copy;
+in generic (skb) mode, which is what was verified on veth, the stack's
+UDP/socket layer is still bypassed but the kernel copies each frame into
+UMEM. The processing thread currently sleeps (`usleep(50)`) when idle
+rather than busy-polling.
 
 ## Why this exists
 
@@ -63,7 +67,7 @@ Two RX backends feed the *identical* downstream pipeline
 
 | Mode    | Path                                   | Requirements                                   |
 |---------|-----------------------------------------|-------------------------------------------------|
-| `afxdp` | Real kernel-bypass, AF_XDP zero-copy   | root, NIC+driver with native XDP, clang+libbpf   |
+| `afxdp` | Kernel-bypass via AF_XDP (zero-copy on supporting NICs, copy mode otherwise) | root, clang (BPF backend) + libbpf |
 | `sim`   | Plain UDP socket (loopback or otherwise)| none — runs anywhere                             |
 
 The `sim` backend isn't a toy stand-in bolted on for show — it exists so
@@ -100,18 +104,19 @@ multicast market data in front of you, including in CI.
   behavior in AF_XDP — the `xsks_map` XSKMAP + `bpf_redirect_map` call
   in `xdp_kern.c` *is* the mechanism. It also means the redirect
   decision (which packets bypass the stack) is explicit, auditable, and
-  narrow: only the market-data multicast port is redirected; everything
-  else gets `XDP_PASS` and behaves like a normal Linux host.
+  narrow: only the configured UDP port (optionally scoped to one multicast
+  group and VLAN) is redirected; everything else gets `XDP_PASS` and behaves
+  like a normal Linux host.
 
 - **Why gaps are detected but not silently patched**: on seeing
-  `seq > expected`, the tracker logs the missing range and enqueues a
-  `recovery_request_t` rather than just resetting `expected_seq` and
-  moving on. The book is *known-stale* for that instrument until a
-  (stubbed here) TCP recovery-feed client fetches the missing range —
-  that stubbing point is deliberate: recovery and the fast feed are
-  different transports with different reliability guarantees, and
-  conflating them in the same code path is a common source of subtle
-  correctness bugs in real feed handlers.
+  `seq > expected`, the tracker records the missing range and the book is
+  marked stale rather than just resetting `expected_seq` and moving on.
+  Recovery runs on a separate reliable transport (TCP snapshot fetch, on its
+  own thread) because the fast feed and the recovery feed have different
+  reliability guarantees, and conflating them in one code path is a common
+  source of subtle correctness bugs in real feed handlers. While stale,
+  live updates are buffered, not applied; after the snapshot loads they are
+  replayed on top of it (see "Book and sequencing semantics").
 
 - **Why SPSC, not MPMC, for the ring buffer**: there is exactly one RX
   thread and one processing thread. A general MPMC ring buffer needs
@@ -134,12 +139,26 @@ make sim
 ./build/packet_gen --dst 127.0.0.1 --port 15000 --count 5000 --drop-pct 2 --sleep-us 200
 ```
 
-Run the test suite (unit tests for the gap detector + an integration
-test that fires real UDP traffic with a known drop rate at the sim
-feed handler and asserts the detected gap count matches exactly):
+Run the test suite (`make test`, no root):
+- unit tests: gap detector (incl. `uint32` wraparound) and the depth book;
+- gap-count integration test: real UDP traffic with a known drop rate, asserts the
+  detected missing count equals what the generator withheld;
+- **recovery end-to-end** (`tests/run_recovery_test.sh`): `packet_gen` acts as the
+  exchange (drops packets, replays stale ones, serves snapshots over TCP) and the
+  handler's final book must be identical to the generator's ground truth. Covers
+  loss, duplicates, and ring overflow forced by `--slow-consumer-us`.
 
 ```sh
 make test
+```
+
+Recovery in sim mode:
+
+```sh
+./build/feed_handler_sim --mode sim --port 15000 --recovery 127.0.0.1:15001
+./build/packet_gen --dst 127.0.0.1 --port 15000 --count 20000 --drop-pct 3 \
+    --dup-pct 5 --drop-tail 12 --serve-port 15001 --serve-ms 3000
+# both print `[book] inst=..` lines at exit; they must match
 ```
 
 ### `afxdp` mode — the real kernel-bypass deliverable
@@ -155,32 +174,67 @@ Requires a Linux box with:
 ```sh
 make afxdp
 sudo ./build/feed_handler_afxdp --mode afxdp --iface eth0 --queue 0 \
-    --bpf build/xdp_kern.o --channel 1
+    --bpf build/xdp_kern.o --channel 1 --port 15000 --group 239.1.1.1 --vlan 100
 # add --skb to force generic mode on drivers without native XDP support
+# --group / --vlan are optional: omit to match any destination IP / any VLAN
 ```
 
-> This sandbox has the kernel UAPI headers (`linux/if_xdp.h`,
-> `linux/bpf.h`) but not `clang`/`libbpf-dev`, and has no NIC to bind
-> to — so `afxdp_socket.c` (the hand-rolled socket/UMEM/ring code, zero
-> external deps) is compile-verified here, but `xdp_kern.c` and
-> `xdp_loader.c` (which need clang-targeting-bpf and libbpf
-> respectively) are provided as complete, correct source to be built on
-> a properly provisioned box — see `make afxdp`.
+The eBPF program matches UDP destination port, and optionally the IPv4
+destination (multicast group) and the outer 802.1Q VLAN id, through a config
+map the loader fills in; it parses up to two stacked VLAN tags (802.1Q/802.1ad).
+Non-matching traffic is `XDP_PASS`ed to the normal stack.
+
+Real-kernel tests on a veth pair (root): `sudo bash tests/run_afxdp_veth_test.sh`
+checks group match/mismatch, VLAN match/wrong-VID/untagged, and snapshot recovery
+over AF_XDP. Latency sim-vs-AF_XDP: `sudo bash bench/run_veth_latency.sh`.
+
+> Verified on a Linux 6.x kernel (WSL2) over a veth pair in generic (skb)
+> XDP mode: the eBPF program loads, redirects through the XSKMAP, and the
+> hand-written UMEM/ring code receives and parses the packets. Use
+> `make afxdp CLANG=clang-14` if your default `clang` lacks the BPF backend.
+> Native zero-copy mode needs a NIC whose driver supports `XDP_ZEROCOPY`
+> (veth does not). Benchmarks and caveats are in [bench/RESULTS.md](bench/RESULTS.md).
+
+## Book and sequencing semantics
+
+- **Duplicates** (`seq` behind the expected value) are counted and skipped, never applied twice.
+- **Sequence numbers use serial-number arithmetic**, so the `uint32` wrap is not
+  misread as a stale packet or a huge gap.
+- **Gaps and ring-full drops mark the channel's books stale** (`book_stale`), recording
+  the sequence number a snapshot must reach (`need_seq`).
+- **Snapshot recovery** (`--recovery host:port`): a recovery thread fetches a full book
+  snapshot over TCP ([recovery_proto.h](include/recovery_proto.h)). While stale, live
+  updates are buffered (not applied). A snapshot is accepted only if its `last_seq >=
+  need_seq`; otherwise it is refetched. The snapshot is loaded, buffered updates with
+  `seq > last_seq` are replayed on top, and the stale flag clears. Messages still queued
+  in the ring that are older than the snapshot are skipped so they cannot overwrite it.
+  Without `--recovery`, updates keep being applied but the book stays flagged stale
+  until a channel reset.
+- **Depth book (10 levels per side)** with MDP3 incremental semantics: NEW inserts and
+  shifts deeper levels down, CHANGE overwrites, DELETE removes and promotes the levels
+  below it ([order_book.h](include/order_book.h), tested in `tests/test_order_book.c`).
+- **User-space frame parsing** honours IPv4 IHL and up to two VLAN tags, and matches the
+  eBPF program's view of the frame.
+- **Latency** is measured from the sender's timestamp in the packet header (set just
+  before `sendto`) to the moment the processing thread pops the message. On the veth
+  test that covers the send syscall, the veth hop, the kernel receive path and the
+  ring handoff. It excludes NIC/PHY time; true NIC-to-user latency needs hardware
+  timestamps. `--busy-poll` and `--cpu-rx/--cpu-proc` remove the idle `usleep`.
 
 ## What's simplified vs. a production system
 
 This is scoped for an interview deliverable, not a drop-in production
 feed handler. Explicitly out of scope, worth naming if asked:
 
-- The TCP recovery-feed client is stubbed as a queued
-  `recovery_request_t`, not an actual second connection replaying
-  missed messages.
-- The order book keeps only best bid/ask per instrument, not a full
-  depth book.
-- No NUMA-aware memory allocation or explicit core pinning
-  (`sched_setaffinity`) for the RX/processing threads, which a real
-  low-latency deployment would want alongside `SCHED_FIFO` and
-  interrupt affinity tuning on the NIC's queues.
+- Recovery is snapshot-only, against the test exchange in `packet_gen`; it
+  speaks a simple private protocol, not CME's real snapshot channel
+  (template 38) or TCP replay, and fetches one snapshot per detected gap.
+- The book is a fixed 10-level price-level book, not an order-by-order book, and
+  the test exchange only emits level-1 updates.
+- No TX path: the TX and completion rings are mapped (the kernel requires it) but unused.
+- Core pinning is available (`--cpu-rx`, `--cpu-proc`) but there is no NUMA-aware
+  allocation, `SCHED_FIFO`, or NIC interrupt-affinity tuning.
+- The idle processing thread uses `usleep(50)` unless `--busy-poll` is set.
 - Single RX queue / single AF_XDP socket. Scaling to line rate on a
   multi-queue NIC means one AF_XDP socket + one pinned RX thread per
   queue, with RSS (or a custom eBPF hash) steering flows to queues.

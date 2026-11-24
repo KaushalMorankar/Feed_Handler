@@ -7,37 +7,41 @@
  * never enter the normal Linux network stack at all.
  *
  * Logic per packet:
- *   1. Parse Ethernet -> IP -> UDP headers directly out of the frame
- *      (bounds-checked against data_end on every step, or the BPF
- *      verifier will reject the program).
- *   2. If it's UDP on our market-data multicast port, XDP_REDIRECT it
- *      into `xsks_map`, an XSKMAP keyed by RX queue index. Whichever
- *      AF_XDP socket is bound to that queue receives the frame
- *      zero-copy -- no skb allocation, no copy to a socket buffer, no
- *      involvement of the normal UDP/IP stack.
+ *   1. Parse Ethernet (+ up to two VLAN tags: 802.1Q / 802.1ad) -> IPv4
+ *      -> UDP directly out of the frame (bounds-checked against data_end
+ *      at every step, or the BPF verifier will reject the program).
+ *   2. Match the flow: UDP destination port, and -- if configured --
+ *      the IPv4 destination (the multicast group) and the outer VLAN id.
+ *      Matching packets are XDP_REDIRECTed into `xsks_map`, an XSKMAP
+ *      keyed by RX queue index; whichever AF_XDP socket is bound to that
+ *      queue receives the frame with no skb and no UDP/IP stack.
  *   3. Anything else: XDP_PASS, so the box keeps working as a normal
- *      Linux host for all other traffic (SSH, the recovery-feed TCP
- *      connection, etc.) -- we only bypass the stack for the specific
- *      flow we're optimizing.
+ *      Linux host for all other traffic (SSH, the recovery TCP
+ *      connection, ...) -- only the one flow is bypassed.
  *
- * Build (on a box with clang/llvm + libbpf-dev + kernel headers):
- *   clang -O2 -g -target bpf -c xdp_kern.c -o xdp_kern.o
+ * The match parameters live in the `xdp_cfg` map (written by the loader),
+ * so the same object serves any group/port/VLAN without recompiling.
  *
- * Load with xdp_loader (uses libbpf) or `ip link set dev <if> xdp obj
- * xdp_kern.o sec xdp` / xdp-loader from the xdp-tools project.
+ * Build:  clang -O2 -g -target bpf -Iinclude -c src/xdp_kern.c -o xdp_kern.o
  */
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
+#include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-/* Must match the port the market data multicast feed publishes on;
- * set at build time or patched via bpf_program__set_attach_target /
- * a BPF global variable in a fancier version of this loader. */
-#define MARKET_DATA_UDP_PORT 15000
+#include "xdp_cfg.h"
+
+/* Fallback if the config map is somehow unreadable. */
+#define DEFAULT_UDP_PORT 15000
+
+struct vlan_hdr {
+    __be16 tci;
+    __be16 encap_proto;
+};
 
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
@@ -46,11 +50,17 @@ struct {
     __uint(value_size, sizeof(int));
 } xsks_map SEC(".maps");
 
-/* Per-queue counters, exposed to userspace for monitoring redirect
- * hit/miss rates without needing to touch the hot path's return value. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct xdp_cfg);
+} xdp_cfg SEC(".maps");
+
+/* Per-CPU counters for monitoring redirect hit/miss rates. */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 2); /* 0 = redirected, 1 = passed */
+    __uint(max_entries, XDP_CNT_MAX);
     __type(key, __u32);
     __type(value, __u64);
 } counters SEC(".maps");
@@ -65,22 +75,46 @@ int xdp_market_data_redirect(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
+    __u32 zero = 0;
+    struct xdp_cfg *cfg = bpf_map_lookup_elem(&xdp_cfg, &zero);
+    __u32 want_group = cfg ? cfg->group_be : 0;
+    __u16 want_port  = cfg ? cfg->port_be : bpf_htons(DEFAULT_UDP_PORT);
+    __u16 want_vlan  = cfg ? cfg->vlan_id : 0;
+
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
+    __be16 proto = eth->h_proto;
+    void *cur = (void *)(eth + 1);
+    __u16 outer_vid = 0;
+
+    /* up to two stacked VLAN tags (QinQ); bounded so the verifier is happy */
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (proto == bpf_htons(ETH_P_8021Q) || proto == bpf_htons(ETH_P_8021AD)) {
+            struct vlan_hdr *vh = cur;
+            if ((void *)(vh + 1) > data_end)
+                return XDP_PASS;
+            if (i == 0)
+                outer_vid = bpf_ntohs(vh->tci) & 0x0FFF;
+            proto = vh->encap_proto;
+            cur = (void *)(vh + 1);
+        }
+    }
+
+    if (proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
 
-    struct iphdr *ip = (void *)(eth + 1);
+    struct iphdr *ip = cur;
     if ((void *)(ip + 1) > data_end)
         return XDP_PASS;
 
     if (ip->protocol != IPPROTO_UDP)
         return XDP_PASS;
 
-    /* ip->ihl is in 32-bit words; handle IP options correctly rather
-     * than assuming a bare 20-byte header */
+    /* ip->ihl is in 32-bit words; handle IP options rather than
+     * assuming a bare 20-byte header */
     __u32 ip_hdr_len = ip->ihl * 4;
     if (ip_hdr_len < sizeof(struct iphdr))
         return XDP_PASS;
@@ -89,16 +123,21 @@ int xdp_market_data_redirect(struct xdp_md *ctx) {
     if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
 
-    if (udp->dest != bpf_htons(MARKET_DATA_UDP_PORT)) {
-        bump(1);
+    if (udp->dest != want_port) {
+        bump(XDP_CNT_WRONG_PORT);
         return XDP_PASS;
     }
 
-    bump(0);
-    /* Redirect into the XSKMAP slot for this RX queue. bpf_redirect_map
-     * returns XDP_REDIRECT on success or falls through per the map's
-     * configured flags; XDP_PASS as the fallback keeps us safe if no
-     * AF_XDP socket is currently bound to this queue. */
+    /* multicast group and VLAN scoping (0 = don't care) */
+    if ((want_group && ip->daddr != want_group) ||
+        (want_vlan && outer_vid != want_vlan)) {
+        bump(XDP_CNT_WRONG_GROUP_OR_VLAN);
+        return XDP_PASS;
+    }
+
+    bump(XDP_CNT_REDIRECTED);
+    /* Redirect into the XSKMAP slot for this RX queue; XDP_PASS as the
+     * fallback keeps us safe if no AF_XDP socket is bound to the queue. */
     return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
 }
 

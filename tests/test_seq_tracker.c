@@ -89,7 +89,29 @@ static void test_first_packet_never_flagged_as_gap(void) {
     printf("test_first_packet_never_flagged_as_gap: PASS\n");
 }
 
+static void test_wraparound(void) {
+    seq_tracker_t t;
+    seq_tracker_init(&t, 1);
+    assert(seq_tracker_observe(&t, 0xFFFFFFFEu, 1) == SEQ_RESULT_OK);
+    assert(seq_tracker_observe(&t, 0xFFFFFFFFu, 2) == SEQ_RESULT_OK);
+    assert(seq_tracker_observe(&t, 0u, 3) == SEQ_RESULT_OK);   /* wrap, in order */
+    assert(seq_tracker_observe(&t, 1u, 4) == SEQ_RESULT_OK);
+    assert(t.packets_duplicate_or_stale == 0 && t.packets_out_of_order_gap == 0);
+    /* a gap that straddles the wrap: expected 2, got 4 */
+    assert(seq_tracker_observe(&t, 4u, 5) == SEQ_RESULT_GAP_DETECTED);
+    assert(t.total_missing_messages == 2);
+    /* a stale packet from before the wrap is a duplicate, not a gap */
+    assert(seq_tracker_observe(&t, 0xFFFFFFFFu, 6) == SEQ_RESULT_DUPLICATE);
+    /* gap that begins before the wrap and ends after it */
+    seq_tracker_init(&t, 1);
+    seq_tracker_observe(&t, 0xFFFFFFFEu, 1);
+    assert(seq_tracker_observe(&t, 1u, 2) == SEQ_RESULT_GAP_DETECTED);
+    assert(t.total_missing_messages == 2); /* 0xFFFFFFFF and 0 */
+    printf("test_wraparound: PASS\n");
+}
+
 int main(void) {
+    test_wraparound();
     test_in_order();
     test_single_gap();
     test_multiple_gaps_queued_in_order();
