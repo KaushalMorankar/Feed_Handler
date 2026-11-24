@@ -3,6 +3,8 @@ CLANG    ?= clang   # must have the BPF backend; e.g. CLANG=clang-14
 CFLAGS   ?= -O2 -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude
 LDFLAGS_SIM   := -lpthread
 LDFLAGS_AFXDP := -lpthread -lbpf
+HOST_MULTIARCH ?= $(shell $(CC) -print-multiarch)
+BPF_CFLAGS := -O2 -g -target bpf -Iinclude -I/usr/include/$(HOST_MULTIARCH)
 
 BUILD := build
 
@@ -34,7 +36,7 @@ $(BUILD)/packet_gen: src/packet_gen.c | $(BUILD)
 afxdp: $(BUILD)/xdp_kern.o $(BUILD)/feed_handler_afxdp
 
 $(BUILD)/xdp_kern.o: src/xdp_kern.c | $(BUILD)
-	$(CLANG) -O2 -g -target bpf -Iinclude -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 $(BUILD)/feed_handler_afxdp: src/feed_handler.c src/mdp3_parser.c src/seq_tracker.c src/afxdp_socket.c src/xdp_loader.c | $(BUILD)
 	$(CC) $(CFLAGS) -DUSE_AFXDP $^ -o $@ $(LDFLAGS_AFXDP)
